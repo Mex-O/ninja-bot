@@ -3,7 +3,7 @@ require('dotenv').config();
 const axios = require('axios');
 
 const bot = new Telegraf(process.env.BOT_TOKEN); // Use .env for safety
-const groupChat = process.env.GROUP_CHAT_ID;     // Also put this in your .env
+const groupChat = process.env.GROUP_CHAT_ID;     // Should be -4634252940
 const NINJA_CODE = process.env.NINJA_CODE;
 
 async function getNinjaPriceAndMarketCap() {
@@ -11,7 +11,7 @@ async function getNinjaPriceAndMarketCap() {
     const response = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
       params: {
         vs_currency: 'usd',
-        ids: 'dog-wif-nunchucks', // Confirm this ID
+        ids: 'ninja-dog-wif-nunchucks', // Correct ID
       }
     });
     const data = response.data[0];
@@ -26,12 +26,132 @@ async function getNinjaPriceAndMarketCap() {
   }
 }
 
-// Check the toy store for Ninja toy buys
 async function checkForBuys() {
+  try {
+    const response = await axios.get('https://lcd.injective.network/cosmos/tx/v1beta1/txs?limit=10');
+    console.log('API Response:', JSON.stringify(response.data, null, 2)); // Detailed logging
+
+    if (response.status !== 200) {
+      throw new Error(`Unexpected response status: ${response.status}`);
+    }
+
+    const buys = response.data.txs;
+
+    if (!buys || buys.length === 0) {
+      console.log('No transactions found');
+      return;
+    }
+
+    const { price, priceChange24h, marketCap } = await getNinjaPriceAndMarketCap();
+
+    for (const buy of buys) {
+      const messages = buy.tx?.body?.messages || [];
+      console.log('Transaction Messages:', JSON.stringify(messages, null, 2)); // Log messages to debug
+
+      const isNinjaBuy = messages.some(msg => {
+        // Check for token transfers
+        if (msg['@type'] === '/cosmos.bank.v1beta1.MsgSend') {
+          return msg.amount?.some(amt => amt.denom.includes(NINJA_CODE));
+        }
+        // Check for DEX trades (e.g., on Hallswap)
+        if (msg['@type'] === '/injective.exchange.v1beta1.MsgExecuteContract') {
+          return JSON.stringify(msg).includes(NINJA_CODE);
+        }
+        // Check for generic contract interactions (e.g., WASM contracts)
+        if (msg['@type'] === '/cosmwasm.wasm.v1.MsgExecuteContract') {
+          return JSON.stringify(msg).includes(NINJA_CODE);
+        }
+        return false;
+      });
+
+      if (isNinjaBuy) {
+        const ninjaBought = messages.find(msg => 
+          (msg['@type'] === '/cosmos.bank.v1beta1.MsgSend' && msg.amount?.some(amt => amt.denom.includes(NINJA_CODE))) ||
+          msg['@type'] === '/injective.exchange.v1beta1.MsgExecuteContract' ||
+          msg['@type'] === '/cosmwasm.wasm.v1.MsgExecuteContract'
+        )
+          ? msg.amount?.find(amt => amt.denom.includes(NINJA_CODE))?.amount / 1e6 || 'Unknown'
+          : 'Unknown';
+        const injSpent = messages.find(msg => 
+          (msg['@type'] === '/cosmos.bank.v1beta1.MsgSend' && msg.amount?.some(amt => amt.denom === 'inj')) ||
+          msg['@type'] === '/injective.exchange.v1beta1.MsgExecuteContract' ||
+          msg['@type'] === '/cosmwasm.wasm.v1.MsgExecuteContract'
+        )
+          ? msg.amount?.find(amt => amt.denom === 'inj')?.amount / 1e18 || 'Unknown'
+          : 'Unknown';
+        const buyer = messages.find(msg => 
+          msg['@type'] === '/cosmos.bank.v1beta1.MsgSend' || 
+          msg['@type'] === '/injective.exchange.v1beta1.MsgExecuteContract' || 
+          msg['@type'] === '/cosmwasm.wasm.v1.MsgExecuteContract'
+        )?.from_address?.slice(0, 4) + '...' + msg.from_address?.slice(-3) || 'Unknown';
+        const usdValue = ninjaBought !== 'Unknown' && price !== 'Unknown' ? (ninjaBought * price).toFixed(2) : 'Unknown';
+
+        const message = `**NEW $NINJA BUY!**\n\n` +
+                        `💰💰 New NINJA Buy 💰💰\n` +
+                        `Bought: ${ninjaBought} NINJA ($${usdValue})\n` +
+                        `Spent: ${injSpent} INJ\n` +
+                        `Buyer: ${buyer} via Hallswap\n\n` +
+                        `Price: $${price} (24h: ${priceChange24h}%)\n` +
+                        `Market Cap: $${marketCap.toLocaleString()}\n\n` +
+                        `Twitter | Web`;
+
+        await bot.telegram.sendAnimation(groupChat, 'https://imgur.com/a/HN21cmT', {
+          caption: message,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: 'Twitter', url: 'https://x.com/dogwifnunchucks' },
+                { text: 'Web', url: 'https://dogwifnunchucks.com' }
+              ],
+              [
+                { text: 'Buy 💰', url: 'https://hallswap.com' },
+                { text: 'Chart 📈', url: 'https://dexscreener.com/injective/ninja' }
+              ]
+            ]
+          }
+        });
+      }
+    }
+  } catch (error) {
+    console.log('Oops! The toy store didn’t answer:', error.message);
+    if (error.response) {
+      console.log('API Error:', error.response.data);
+    } else if (error.request) {
+      console.log('No response from the server:', error.request);
+    } else {
+      console.log('Request setup error:', error.message);
+    }
+    
+    // Retry after 10 seconds (limit to 3 retries to avoid endless loops)
+    if (!checkForBuys.retryCount) checkForBuys.retryCount = 0;
+    if (checkForBuys.retryCount < 3) {
+      checkForBuys.retryCount++;
+      console.log(`Retrying in 10 seconds... (Attempt ${checkForBuys.retryCount}/3)`);
+      setTimeout(checkForBuys, 10000);
+    } else {
+      console.log('Max retries reached. Stopping retries.');
+      checkForBuys.retryCount = 0; // Reset for next cycle
+    }
+  }
+}
+
+// Check every 30 seconds (to avoid rate limits)
+setInterval(checkForBuys, 30000);
+
+// Start the robot
+bot.launch();
+bot.telegram.sendMessage(groupChat, "Hi! I’m your Ninja toy robot. I’m starting now! 🐶");
+console.log('Group Chat ID:', groupChat);
+console.log('Robot is watching for Ninja toy buys!');
+
+// Check the toy store for Ninja toy buys
+/*async function checkForBuys() {
   try {
     const response = await axios.get('https://lcd.injective.network/cosmos/tx/v1beta1/txs', {
       params: {
-        limit: 10
+        limit: 10,
+        events:`transfer.recipient='${NINJA_CODE}'`
       }
     });
 
@@ -106,4 +226,4 @@ setInterval(checkForBuys, 10000);
 
 // Start the robot
 bot.launch();
-console.log('Robot is watching for Ninja toy buys!');
+console.log('Robot is watching for Ninja toy buys!');*/
